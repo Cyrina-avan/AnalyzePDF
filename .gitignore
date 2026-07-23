@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+
+# Local PDF inputs and analysis outputs
+*.pdf
+pdfs/
+output/
+results/
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.*
+
+# IDE / OS / agents
+.idea/
+.vscode/
+.agents/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Caches / logs
+.cache/
+.ruff_cache/
+.mypy_cache/
+*.log

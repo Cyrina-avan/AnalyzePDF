@@ -1,0 +1,19 @@
+[project]
+name = "analyzepdf"
+version = "0.1.0"
+description = "使用 Docling 解析 PDF，导出 Markdown、JSON 和表格 CSV"
+requires-python = ">=3.12"
+dependencies = [
+    "docling>=2.112.0",
+    "torch",
+    "torchvision",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
