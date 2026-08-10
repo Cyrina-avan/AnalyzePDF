@@ -1,7 +1,7 @@
 # AnalyzePDF
 
 使用 Docling 解析 PDF，导出 Markdown（可选 JSON、表格 CSV、图片）。  
-支持 Windows / Linux；设备默认 `auto`（有 CUDA 用 GPU，否则 CPU）。
+支持 Windows / Linux / macOS；设备默认 `auto`（有 CUDA/MPS 时使用可用加速，否则 CPU）。
 
 ## 环境准备
 
@@ -18,19 +18,18 @@ uv sync
 2. 重新 `uv sync`
 3. 运行时用 `--device cpu`（或 `ANALYZEPDF_DEVICE=cpu`）
 
-首次运行会从 HuggingFace 拉布局/表格等模型；国内可设：
+macOS 会使用 PyTorch 官方平台 wheel，不会从 CUDA index 安装；如果当前进程无法使用 MPS，请显式传 `--device cpu`。
+
+首次运行会从 HuggingFace 拉布局/表格等模型。国内网络若直连较慢，可耐心等待；**不要**全局设置 `HF_ENDPOINT=https://hf-mirror.com`，Docling 所需模型在部分镜像上不可用，会导致下载失败。
+
+AnalyzePDF 默认会忽略 shell 里的 `HF_ENDPOINT`，改从官方 Hub 下载。若你确认镜像完整可用，可显式保留：
 
 ```bash
+export ANALYZEPDF_USE_HF_MIRROR=1
 export HF_ENDPOINT=https://hf-mirror.com
-export HF_HUB_DISABLE_XET=1
 ```
 
-PowerShell：
-
-```powershell
-$env:HF_ENDPOINT = "https://hf-mirror.com"
-$env:HF_HUB_DISABLE_XET = "1"
-```
+如需加速其他 HuggingFace 资源，可在 AnalyzePDF 之外单独使用镜像；解析 PDF 时建议不设 `HF_ENDPOINT`。
 
 离线环境请预先打包模型缓存，并设置 `HF_HUB_OFFLINE=1`。
 
@@ -100,7 +99,8 @@ output/
         content.json
         artifacts/          # 仅一份；由 Docling 写出，不再二次导出
         tables/
-        source.txt          # 原始文件名 + 绝对路径
+        source.txt          # 原始文件名 + 源内容 SHA-256；不记录绝对路径
+        run.json            # 源/代码/配置指纹、实际 backend、处理时间与产物哈希
 ```
 
 `--slim` 模式仅保留：
@@ -113,7 +113,8 @@ output/
 ```
 
 文件名过长或含特殊字符时会缩短目录名，并附带路径摘要 hash。  
-断点续跑：仅当 `content.md` 非空且 `source.txt` 第一行等于当前 PDF 文件名时才跳过；否则用 `--force` 重转。  
+断点续跑：仅当源内容 SHA-256、解析脚本 SHA-256、OCR/输出配置和全部产物哈希均匹配时才跳过；旧版输出没有 `run.json`，首次会自动重转。仍可用 `--force` 强制重转。
+重新解析会先清理本工具管理的旧 Markdown、JSON、表格、图片和运行元数据，避免输出配置变化后残留过期 Artifact；输出目录中的其他用户文件不会被删除。
 单个文件失败不中断整批；若有失败，进程退出码为 `1`。  
 部分异常 PDF 会自动改用 `pypdfium2`。  
 会自动忽略 Office 临时文件（`~$*.pdf`）。
@@ -122,3 +123,11 @@ output/
 
 - 不要设置 `DOCLING_DEVICE=CPU`（大写）这类变量，可能在 import 阶段触发 pydantic 问题；请用本工具的 `--device` / `ANALYZEPDF_DEVICE`。
 - 解析只忠实还原 PDF 内容；源文件本身错档/串文无法在本层自动纠正。
+
+## 自检
+
+回归测试只使用标准库测试框架，不会新增依赖或下载模型：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m unittest discover -s tests -v
+```

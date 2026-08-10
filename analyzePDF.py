@@ -2,16 +2,57 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 import re
+import shutil
 import sys
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+HF_MIRROR_ENV_VAR = "HF_ENDPOINT"
+USE_HF_MIRROR_ENV_VAR = "ANALYZEPDF_USE_HF_MIRROR"
+
+
+def configure_stdio() -> None:
+    """尽量让中文日志在 Windows / Linux 控制台都能打印，避免 GBK 打断整批任务。"""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def configure_hf_hub() -> None:
+    """在导入 Docling/HuggingFace 前决定 Endpoint，避免库内缓存旧值。"""
+
+    if os.environ.get(USE_HF_MIRROR_ENV_VAR):
+        return
+
+    mirror = os.environ.pop(HF_MIRROR_ENV_VAR, None)
+    if mirror:
+        print(
+            f"提示：已忽略 {HF_MIRROR_ENV_VAR}={mirror!r}，"
+            "Docling 模型将从官方 Hugging Face Hub 下载。"
+            f"若你确认镜像可用，可设 {USE_HF_MIRROR_ENV_VAR}=1 保留镜像。",
+            file=sys.stderr,
+        )
+
+
+# HuggingFace 会在 import 时缓存 Endpoint，因此必须先配置再导入 Docling。
+configure_stdio()
+configure_hf_hub()
 
 # Windows 下 HuggingFace 缓存不支持符号链接，这条警告可以忽略
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-
-from pathlib import Path
 
 from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
@@ -26,7 +67,20 @@ from docling_core.types.doc import ImageRefMode
 ARTIFACTS_DIR_NAME = "artifacts"
 MARKDOWN_FILENAME = "content.md"
 SOURCE_FILENAME = "source.txt"
+RUN_METADATA_FILENAME = "run.json"
 DEVICE_ENV_VAR = "ANALYZEPDF_DEVICE"
+OUTPUT_STATE_VERSION = 1
+
+
+def package_version(package: str, fallback: str = "unknown") -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return fallback
+
+
+PARSER_VERSION = package_version("analyzepdf", "0.1.0")
+ENGINE_VERSION = package_version("docling")
 
 
 @dataclass(frozen=True)
@@ -63,16 +117,12 @@ class BatchResult:
         return bool(self.failures)
 
 
-def configure_stdio() -> None:
-    """尽量让中文日志在 Windows / Linux 控制台都能打印，避免 GBK 打断整批任务。"""
+@dataclass(frozen=True)
+class ConversionOutcome:
+    """Docling 结果及实际成功的 PDF backend。"""
 
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+    result: Any
+    backend: str
 
 
 def resolve_accelerator_device(device: str | None = None) -> AcceleratorDevice:
@@ -207,13 +257,108 @@ def read_source_filename(source_path: Path) -> str | None:
     return first or None
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def output_request(use_ocr: bool, options: OutputOptions) -> dict[str, Any]:
+    return {
+        "use_ocr": use_ocr,
+        "output_options": asdict(options),
+    }
+
+
+def read_run_metadata(output_dir: Path) -> dict[str, Any] | None:
+    metadata_path = output_dir / RUN_METADATA_FILENAME
+    if not metadata_path.is_file():
+        return None
+    try:
+        value = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def output_inventory(output_dir: Path) -> list[dict[str, Any]]:
+    managed_paths: list[Path] = []
+    for filename in (MARKDOWN_FILENAME, SOURCE_FILENAME, "content.json"):
+        path = output_dir / filename
+        if path.is_file():
+            managed_paths.append(path)
+    for directory_name in (ARTIFACTS_DIR_NAME, "tables"):
+        directory = output_dir / directory_name
+        if directory.is_dir():
+            managed_paths.extend(path for path in directory.rglob("*") if path.is_file())
+
+    inventory: list[dict[str, Any]] = []
+    for path in sorted(managed_paths):
+        inventory.append(
+            {
+                "path": path.relative_to(output_dir).as_posix(),
+                "byte_size": path.stat().st_size,
+                "content_sha256": file_sha256(path),
+            }
+        )
+    return inventory
+
+
+def inventory_matches(output_dir: Path, inventory: Any) -> bool:
+    if not isinstance(inventory, list) or not inventory:
+        return False
+    for item in inventory:
+        if not isinstance(item, dict):
+            return False
+        relative_path = item.get("path")
+        expected_size = item.get("byte_size")
+        expected_hash = item.get("content_sha256")
+        if not isinstance(relative_path, str) or not relative_path or "\\" in relative_path:
+            return False
+        path = Path(relative_path)
+        if path.is_absolute() or ".." in path.parts:
+            return False
+        artifact = output_dir / path
+        if not artifact.is_file() or artifact.stat().st_size != expected_size:
+            return False
+        if file_sha256(artifact) != expected_hash:
+            return False
+    return True
+
+
+def clear_previous_generated_outputs(output_dir: Path) -> None:
+    """只清理本工具管理的产物；保留输出目录中的其他用户文件。"""
+
+    for filename in (
+        MARKDOWN_FILENAME,
+        SOURCE_FILENAME,
+        "content.json",
+        RUN_METADATA_FILENAME,
+    ):
+        path = output_dir / filename
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+
+    for directory_name in (ARTIFACTS_DIR_NAME, "tables"):
+        path = output_dir / directory_name
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+
 def should_skip_existing(
     pdf_path: Path,
     output_dir: Path,
     *,
     force: bool = False,
+    use_ocr: bool = False,
+    output_options: OutputOptions | None = None,
+    source_sha256: str | None = None,
 ) -> bool:
-    """仅当 content.md 非空且 source.txt 文件名匹配时跳过。"""
+    """仅当源内容、解析代码、请求配置和全部产物仍一致时跳过。"""
 
     if force:
         return False
@@ -222,11 +367,26 @@ def should_skip_existing(
     if not markdown_path.is_file() or markdown_path.stat().st_size <= 0:
         return False
 
-    recorded = read_source_filename(output_dir / SOURCE_FILENAME)
-    if recorded is None:
+    metadata = read_run_metadata(output_dir)
+    if metadata is None:
         return False
 
-    return recorded == pdf_path.name
+    options = output_options or OutputOptions.full()
+    source_hash = source_sha256 or file_sha256(pdf_path)
+    parser_hash = file_sha256(Path(__file__).resolve())
+    if metadata.get("output_state_version") != OUTPUT_STATE_VERSION:
+        return False
+    if metadata.get("source", {}).get("content_sha256") != source_hash:
+        return False
+    if metadata.get("source", {}).get("byte_size") != pdf_path.stat().st_size:
+        return False
+    if metadata.get("parser", {}).get("source_sha256") != parser_hash:
+        return False
+    if metadata.get("request") != output_request(use_ocr, options):
+        return False
+    if metadata.get("result", {}).get("status") != "succeeded":
+        return False
+    return inventory_matches(output_dir, metadata.get("output_files"))
 
 
 def create_converter(
@@ -268,6 +428,24 @@ def convert_pdf(
 ):
     """先用默认解析器，失败时自动切换到 pypdfium2。"""
 
+    return _convert_pdf_with_backend(
+        input_path=input_path,
+        use_ocr=use_ocr,
+        converter=converter,
+        device=device,
+        output_options=output_options,
+    ).result
+
+
+def _convert_pdf_with_backend(
+    input_path: Path,
+    use_ocr: bool,
+    converter: DocumentConverter | None = None,
+    device: AcceleratorDevice | None = None,
+    output_options: OutputOptions | None = None,
+) -> ConversionOutcome:
+    """内部版本同时返回实际成功的 backend，供运行元数据记录。"""
+
     attempts: list[tuple[str, DocumentConverter | None]] = [
         ("docling-parse", converter),
         ("pypdfium2", None),
@@ -300,7 +478,7 @@ def convert_pdf(
         if conversion_result.status == ConversionStatus.SUCCESS:
             if backend_name != "docling-parse":
                 print(f"已切换到备用解析器：{backend_name}")
-            return conversion_result
+            return ConversionOutcome(result=conversion_result, backend=backend_name)
 
         last_error = "; ".join(str(error) for error in (conversion_result.errors or []))
         print(f"解析器 {backend_name} 失败，尝试下一个...")
@@ -338,10 +516,17 @@ def write_outputs(
     input_path: Path,
     output_path: Path,
     options: OutputOptions,
+    *,
+    source_sha256: str,
+    use_ocr: bool,
+    backend: str,
+    started_at: datetime,
+    started_monotonic: float,
 ) -> None:
     """在解析成功后再创建目录并写文件，避免失败时留下空壳目录。"""
 
     output_path.mkdir(parents=True, exist_ok=True)
+    clear_previous_generated_outputs(output_path)
     table_dir = output_path / "tables"
     if options.write_tables:
         table_dir.mkdir(parents=True, exist_ok=True)
@@ -365,7 +550,7 @@ def write_outputs(
         artifacts_dir = None
 
     (output_path / SOURCE_FILENAME).write_text(
-        f"{input_path.name}\n{input_path.resolve()}\n",
+        f"{input_path.name}\nsha256:{source_sha256}\n",
         encoding="utf-8",
     )
 
@@ -378,6 +563,7 @@ def write_outputs(
         )
 
     if options.write_tables:
+        table_errors: list[str] = []
         for table_index, table in enumerate(document.tables, start=1):
             try:
                 dataframe = table.export_to_dataframe(doc=document)
@@ -389,6 +575,41 @@ def write_outputs(
                 )
             except Exception as error:
                 print(f"表格 {table_index} 导出失败：{error}")
+                table_errors.append(f"table_{table_index:03d}: {error}")
+        if table_errors:
+            raise RuntimeError(
+                f"{len(table_errors)} 个表格导出失败；未发布 {RUN_METADATA_FILENAME}，"
+                "下次运行会重新处理"
+            )
+
+    completed_at = datetime.now(timezone.utc)
+    run_metadata = {
+        "output_state_version": OUTPUT_STATE_VERSION,
+        "source": {
+            "content_sha256": source_sha256,
+            "byte_size": input_path.stat().st_size,
+        },
+        "parser": {
+            "name": "AnalyzePDF",
+            "version": PARSER_VERSION,
+            "engine_name": "docling",
+            "engine_version": ENGINE_VERSION,
+            "backend": backend,
+            "source_sha256": file_sha256(Path(__file__).resolve()),
+        },
+        "request": output_request(use_ocr, options),
+        "result": {
+            "status": "succeeded",
+            "started_at": started_at.isoformat().replace("+00:00", "Z"),
+            "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
+            "duration_ms": round((time.monotonic() - started_monotonic) * 1000),
+        },
+        "output_files": output_inventory(output_path),
+    }
+    (output_path / RUN_METADATA_FILENAME).write_text(
+        json.dumps(run_metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     print("解析完成：")
     print(f"Markdown：{markdown_path.resolve()}")
@@ -426,7 +647,15 @@ def parse_pdf(
     if not input_path.exists():
         raise FileNotFoundError(f"没有找到 PDF 文件：{input_path.resolve()}")
 
-    if should_skip_existing(input_path, output_path, force=force):
+    source_content_sha256 = file_sha256(input_path)
+    if should_skip_existing(
+        input_path,
+        output_path,
+        force=force,
+        use_ocr=use_ocr,
+        output_options=options,
+        source_sha256=source_content_sha256,
+    ):
         print(f"已存在且 source 匹配，跳过：{output_path / MARKDOWN_FILENAME}")
         return output_path
 
@@ -443,13 +672,16 @@ def parse_pdf(
     )
 
     # 先解析，成功后再落盘，避免失败留下空目录
-    conversion_result = convert_pdf(
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
+    outcome = _convert_pdf_with_backend(
         input_path=input_path,
         use_ocr=use_ocr,
         converter=converter,
         device=device,
         output_options=options,
     )
+    conversion_result = outcome.result
     document = conversion_result.document
 
     if document is None:
@@ -466,6 +698,11 @@ def parse_pdf(
         input_path=input_path,
         output_path=output_path,
         options=options,
+        source_sha256=source_content_sha256,
+        use_ocr=use_ocr,
+        backend=outcome.backend,
+        started_at=started_at,
+        started_monotonic=started_monotonic,
     )
     return output_path
 
@@ -495,7 +732,13 @@ def parse_pdf_batch(
     for index, pdf_path in enumerate(pdf_files, start=1):
         print(f"\n[{index}/{len(pdf_files)}] 处理 {pdf_path.name}")
         output_dir = resolve_output_dir(pdf_path, Path(output_root), input_root)
-        if should_skip_existing(pdf_path, output_dir, force=force):
+        if should_skip_existing(
+            pdf_path,
+            output_dir,
+            force=force,
+            use_ocr=use_ocr,
+            output_options=options,
+        ):
             print(f"已存在且 source 匹配，跳过：{output_dir / MARKDOWN_FILENAME}")
             result.output_dirs.append(output_dir)
             result.skipped += 1
