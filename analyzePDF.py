@@ -60,7 +60,6 @@ from docling.datamodel.accelerator_options import AcceleratorDevice, Accelerator
 from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import RapidOcrOptions, ThreadedPdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.exceptions import ConversionError
 from docling_core.types.doc import ImageRefMode
 
 
@@ -111,18 +110,32 @@ class BatchResult:
     output_dirs: list[Path] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     skipped: int = 0
+    partial: int = 0
 
     @property
     def failed(self) -> bool:
         return bool(self.failures)
 
+    @property
+    def has_issues(self) -> bool:
+        return self.failed or self.partial > 0
+
 
 @dataclass(frozen=True)
 class ConversionOutcome:
-    """Docling 结果及实际成功的 PDF backend。"""
+    """Docling 结果、实际 backend 与可公开的降级错误。"""
 
     result: Any
     backend: str
+    errors: tuple[dict[str, Any], ...] = ()
+
+
+class PDFConversionFailure(RuntimeError):
+    """All parser backends failed, with sanitized machine-readable errors."""
+
+    def __init__(self, errors: list[dict[str, Any]]) -> None:
+        super().__init__("所有 PDF 解析后端均失败")
+        self.errors = tuple(errors)
 
 
 def resolve_accelerator_device(device: str | None = None) -> AcceleratorDevice:
@@ -270,6 +283,77 @@ def output_request(use_ocr: bool, options: OutputOptions) -> dict[str, Any]:
         "use_ocr": use_ocr,
         "output_options": asdict(options),
     }
+
+
+def sanitize_error_message(message: object, input_path: Path | None = None) -> str:
+    """Collapse an upstream error into a short message without source paths."""
+
+    text = str(message).split("Traceback (most recent call last)", 1)[0]
+    if input_path is not None:
+        candidates = {
+            str(input_path),
+            str(input_path.resolve()),
+            input_path.name,
+        }
+        for candidate in sorted(candidates, key=len, reverse=True):
+            if candidate:
+                text = text.replace(candidate, "[source]")
+    text = re.sub(
+        r"(?:(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s,;:()]+"
+        r"|\\\\[^\\\s]+[\\/][^\s,;:()]+"
+        r"|(?<![A-Za-z0-9:/])/(?:Users|Volumes|home|private|tmp|var|mnt)/[^\s,;:()]+)",
+        "[path]",
+        text,
+    )
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return (text or "No safe diagnostic detail was available")[:500]
+
+
+def error_record(
+    *,
+    code: str,
+    stage: str,
+    message: object,
+    retryable: bool,
+    input_path: Path | None = None,
+    page_number: int | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "code": code,
+        "stage": stage,
+        "sanitized_message": sanitize_error_message(message, input_path),
+        "retryable": retryable,
+    }
+    if page_number is not None:
+        record["page_number"] = page_number
+    return record
+
+
+def classify_parse_error(error: object, input_path: Path, backend: str) -> dict[str, Any]:
+    """Classify only well-known retry cases; unknown corruption is not retryable."""
+
+    message = str(error)
+    lowered = message.lower()
+    if any(token in lowered for token in ("password", "encrypted", "encryption")):
+        code = "PDF_ENCRYPTED"
+        retryable = False
+    elif any(token in lowered for token in ("timeout", "timed out")):
+        code = "PARSE_TIMEOUT"
+        retryable = True
+    elif any(token in lowered for token in ("out of memory", "resource exhausted")):
+        code = "RESOURCE_EXHAUSTED"
+        retryable = True
+    else:
+        code = "PDF_PARSE_FAILED"
+        retryable = False
+    return error_record(
+        code=code,
+        stage="parse",
+        message=f"{backend}: {message}",
+        retryable=retryable,
+        input_path=input_path,
+    )
 
 
 def read_run_metadata(output_dir: Path) -> dict[str, Any] | None:
@@ -444,34 +528,34 @@ def _convert_pdf_with_backend(
     device: AcceleratorDevice | None = None,
     output_options: OutputOptions | None = None,
 ) -> ConversionOutcome:
-    """内部版本同时返回实际成功的 backend，供运行元数据记录。"""
+    """Prefer a complete result, but preserve a usable partial result."""
 
     attempts: list[tuple[str, DocumentConverter | None]] = [
         ("docling-parse", converter),
         ("pypdfium2", None),
     ]
 
-    last_error = "未知错误"
+    attempt_errors: list[dict[str, Any]] = []
+    partial_outcome: ConversionOutcome | None = None
 
     for backend_name, shared_converter in attempts:
-        active_converter = shared_converter
-        if active_converter is None:
-            backend = (
-                DoclingParseDocumentBackend
-                if backend_name == "docling-parse"
-                else PyPdfiumDocumentBackend
-            )
-            active_converter = create_converter(
-                use_ocr=use_ocr,
-                backend=backend,
-                device=device,
-                output_options=output_options,
-            )
-
         try:
+            active_converter = shared_converter
+            if active_converter is None:
+                backend = (
+                    DoclingParseDocumentBackend
+                    if backend_name == "docling-parse"
+                    else PyPdfiumDocumentBackend
+                )
+                active_converter = create_converter(
+                    use_ocr=use_ocr,
+                    backend=backend,
+                    device=device,
+                    output_options=output_options,
+                )
             conversion_result = active_converter.convert(input_path)
-        except ConversionError as error:
-            last_error = str(error)
+        except Exception as error:
+            attempt_errors.append(classify_parse_error(error, input_path, backend_name))
             print(f"解析器 {backend_name} 失败，尝试下一个...")
             continue
 
@@ -480,10 +564,46 @@ def _convert_pdf_with_backend(
                 print(f"已切换到备用解析器：{backend_name}")
             return ConversionOutcome(result=conversion_result, backend=backend_name)
 
-        last_error = "; ".join(str(error) for error in (conversion_result.errors or []))
+        status_errors = list(conversion_result.errors or [])
+        if not status_errors:
+            status_errors = [f"backend returned status {conversion_result.status.value}"]
+        records = [
+            classify_parse_error(error, input_path, backend_name)
+            for error in status_errors
+        ]
+        if conversion_result.status == ConversionStatus.PARTIAL_SUCCESS:
+            records = [{**record, "code": "PDF_PARTIAL_PARSE"} for record in records]
+        if (
+            conversion_result.status == ConversionStatus.PARTIAL_SUCCESS
+            and conversion_result.document is not None
+            and partial_outcome is None
+        ):
+            partial_outcome = ConversionOutcome(
+                result=conversion_result,
+                backend=backend_name,
+                errors=tuple(records),
+            )
+        attempt_errors.extend(records)
         print(f"解析器 {backend_name} 失败，尝试下一个...")
 
-    raise RuntimeError(f"PDF 解析失败：{input_path.name}（{last_error}）")
+    if partial_outcome is not None:
+        print(f"完整解析不可用，保留部分成功结果：{partial_outcome.backend}")
+        return ConversionOutcome(
+            result=partial_outcome.result,
+            backend=partial_outcome.backend,
+            errors=tuple(attempt_errors),
+        )
+
+    if not attempt_errors:
+        attempt_errors.append(
+            error_record(
+                code="PDF_PARSE_FAILED",
+                stage="parse",
+                message="All PDF parser backends failed without diagnostic detail",
+                retryable=False,
+            )
+        )
+    raise PDFConversionFailure(attempt_errors)
 
 
 def is_temp_office_pdf(path: Path) -> bool:
@@ -511,6 +631,80 @@ def collect_pdf_files(target: Path, recursive: bool = True) -> list[Path]:
     return pdf_files
 
 
+def write_run_metadata(
+    *,
+    input_path: Path,
+    output_path: Path,
+    options: OutputOptions,
+    source_sha256: str,
+    use_ocr: bool,
+    backend: str,
+    status: str,
+    errors: list[dict[str, Any]],
+    started_at: datetime,
+    started_monotonic: float,
+) -> None:
+    completed_at = datetime.now(timezone.utc)
+    run_metadata = {
+        "output_state_version": OUTPUT_STATE_VERSION,
+        "source": {
+            "content_sha256": source_sha256,
+            "byte_size": input_path.stat().st_size,
+        },
+        "parser": {
+            "name": "AnalyzePDF",
+            "version": PARSER_VERSION,
+            "engine_name": "docling",
+            "engine_version": ENGINE_VERSION,
+            "backend": backend,
+            "source_sha256": file_sha256(Path(__file__).resolve()),
+        },
+        "request": output_request(use_ocr, options),
+        "result": {
+            "status": status,
+            "started_at": started_at.isoformat().replace("+00:00", "Z"),
+            "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
+            "duration_ms": round((time.monotonic() - started_monotonic) * 1000),
+        },
+        "errors": errors,
+        "output_files": output_inventory(output_path),
+    }
+    (output_path / RUN_METADATA_FILENAME).write_text(
+        json.dumps(run_metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def publish_failed_run(
+    *,
+    input_path: Path,
+    output_path: Path,
+    options: OutputOptions,
+    source_sha256: str,
+    use_ocr: bool,
+    backend: str,
+    errors: list[dict[str, Any]],
+    started_at: datetime,
+    started_monotonic: float,
+) -> None:
+    """Replace stale managed outputs with one durable failed-run record."""
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    clear_previous_generated_outputs(output_path)
+    write_run_metadata(
+        input_path=input_path,
+        output_path=output_path,
+        options=options,
+        source_sha256=source_sha256,
+        use_ocr=use_ocr,
+        backend=backend,
+        status="failed",
+        errors=errors,
+        started_at=started_at,
+        started_monotonic=started_monotonic,
+    )
+
+
 def write_outputs(
     document,
     input_path: Path,
@@ -520,10 +714,11 @@ def write_outputs(
     source_sha256: str,
     use_ocr: bool,
     backend: str,
+    conversion_errors: tuple[dict[str, Any], ...],
     started_at: datetime,
     started_monotonic: float,
 ) -> None:
-    """在解析成功后再创建目录并写文件，避免失败时留下空壳目录。"""
+    """Write complete or usable partial outputs, followed by durable metadata."""
 
     output_path.mkdir(parents=True, exist_ok=True)
     clear_previous_generated_outputs(output_path)
@@ -562,8 +757,8 @@ def write_outputs(
             encoding="utf-8",
         )
 
+    run_errors = list(conversion_errors)
     if options.write_tables:
-        table_errors: list[str] = []
         for table_index, table in enumerate(document.tables, start=1):
             try:
                 dataframe = table.export_to_dataframe(doc=document)
@@ -575,41 +770,34 @@ def write_outputs(
                 )
             except Exception as error:
                 print(f"表格 {table_index} 导出失败：{error}")
-                table_errors.append(f"table_{table_index:03d}: {error}")
-        if table_errors:
-            raise RuntimeError(
-                f"{len(table_errors)} 个表格导出失败；未发布 {RUN_METADATA_FILENAME}，"
-                "下次运行会重新处理"
-            )
+                run_errors.append(
+                    error_record(
+                        code="TABLE_EXPORT_FAILED",
+                        stage="export",
+                        message=f"table {table_index} export failed: {error}",
+                        retryable=False,
+                        input_path=input_path,
+                    )
+                )
 
-    completed_at = datetime.now(timezone.utc)
-    run_metadata = {
-        "output_state_version": OUTPUT_STATE_VERSION,
-        "source": {
-            "content_sha256": source_sha256,
-            "byte_size": input_path.stat().st_size,
-        },
-        "parser": {
-            "name": "AnalyzePDF",
-            "version": PARSER_VERSION,
-            "engine_name": "docling",
-            "engine_version": ENGINE_VERSION,
-            "backend": backend,
-            "source_sha256": file_sha256(Path(__file__).resolve()),
-        },
-        "request": output_request(use_ocr, options),
-        "result": {
-            "status": "succeeded",
-            "started_at": started_at.isoformat().replace("+00:00", "Z"),
-            "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
-            "duration_ms": round((time.monotonic() - started_monotonic) * 1000),
-        },
-        "output_files": output_inventory(output_path),
-    }
-    (output_path / RUN_METADATA_FILENAME).write_text(
-        json.dumps(run_metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    status = "partial" if run_errors else "succeeded"
+    write_run_metadata(
+        input_path=input_path,
+        output_path=output_path,
+        options=options,
+        source_sha256=source_sha256,
+        use_ocr=use_ocr,
+        backend=backend,
+        status=status,
+        errors=run_errors,
+        started_at=started_at,
+        started_monotonic=started_monotonic,
     )
+
+    if status == "partial":
+        print(
+            f"部分解析完成：保留可用输出，并记录 {len(run_errors)} 条机器可读错误"
+        )
 
     print("解析完成：")
     print(f"Markdown：{markdown_path.resolve()}")
@@ -671,21 +859,53 @@ def parse_pdf(
         f"images={'开' if options.export_images else '关'}"
     )
 
-    # 先解析，成功后再落盘，避免失败留下空目录
     started_at = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
-    outcome = _convert_pdf_with_backend(
-        input_path=input_path,
-        use_ocr=use_ocr,
-        converter=converter,
-        device=device,
-        output_options=options,
-    )
+    try:
+        outcome = _convert_pdf_with_backend(
+            input_path=input_path,
+            use_ocr=use_ocr,
+            converter=converter,
+            device=device,
+            output_options=options,
+        )
+    except PDFConversionFailure as error:
+        publish_failed_run(
+            input_path=input_path,
+            output_path=output_path,
+            options=options,
+            source_sha256=source_content_sha256,
+            use_ocr=use_ocr,
+            backend="docling-parse+pypdfium2",
+            errors=list(error.errors),
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+        )
+        raise
     conversion_result = outcome.result
     document = conversion_result.document
 
     if document is None:
-        raise RuntimeError(f"PDF 解析未生成文档：{input_path.name}")
+        errors = [
+            error_record(
+                code="DOCUMENT_MISSING",
+                stage="parse",
+                message="Parser completed without producing a document",
+                retryable=False,
+            )
+        ]
+        publish_failed_run(
+            input_path=input_path,
+            output_path=output_path,
+            options=options,
+            source_sha256=source_content_sha256,
+            use_ocr=use_ocr,
+            backend=outcome.backend,
+            errors=errors,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+        )
+        raise RuntimeError("PDF 解析未生成文档")
 
     print(f"转换状态：{conversion_result.status}")
     if conversion_result.errors:
@@ -693,17 +913,41 @@ def parse_pdf(
         for error in conversion_result.errors:
             print(f"- {error}")
 
-    write_outputs(
-        document=document,
-        input_path=input_path,
-        output_path=output_path,
-        options=options,
-        source_sha256=source_content_sha256,
-        use_ocr=use_ocr,
-        backend=outcome.backend,
-        started_at=started_at,
-        started_monotonic=started_monotonic,
-    )
+    try:
+        write_outputs(
+            document=document,
+            input_path=input_path,
+            output_path=output_path,
+            options=options,
+            source_sha256=source_content_sha256,
+            use_ocr=use_ocr,
+            backend=outcome.backend,
+            conversion_errors=outcome.errors,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+        )
+    except Exception as error:
+        errors = [
+            error_record(
+                code="OUTPUT_EXPORT_FAILED",
+                stage="export",
+                message=error,
+                retryable=False,
+                input_path=input_path,
+            )
+        ]
+        publish_failed_run(
+            input_path=input_path,
+            output_path=output_path,
+            options=options,
+            source_sha256=source_content_sha256,
+            use_ocr=use_ocr,
+            backend=outcome.backend,
+            errors=errors,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+        )
+        raise
     return output_path
 
 
@@ -744,26 +988,28 @@ def parse_pdf_batch(
             result.skipped += 1
             continue
         try:
-            result.output_dirs.append(
-                parse_pdf(
-                    pdf_path=pdf_path,
-                    output_root=output_root,
-                    use_ocr=use_ocr,
-                    converter=converter,
-                    device=accelerator,
-                    output_options=options,
-                    input_root=input_root,
-                    force=force,
-                )
+            parsed_output = parse_pdf(
+                pdf_path=pdf_path,
+                output_root=output_root,
+                use_ocr=use_ocr,
+                converter=converter,
+                device=accelerator,
+                output_options=options,
+                input_root=input_root,
+                force=force,
             )
+            result.output_dirs.append(parsed_output)
+            metadata = read_run_metadata(parsed_output) or {}
+            if metadata.get("result", {}).get("status") == "partial":
+                result.partial += 1
         except Exception as error:
             print(f"处理失败：{pdf_path.name}")
             print(f"错误：{error}", file=sys.stderr)
             result.failures.append(f"{pdf_path}: {error}")
 
     print(
-        f"\n批量结束：成功 {len(result.output_dirs) - result.skipped}，"
-        f"跳过 {result.skipped}，失败 {len(result.failures)}"
+        f"\n批量结束：成功 {len(result.output_dirs) - result.skipped - result.partial}，"
+        f"部分成功 {result.partial}，跳过 {result.skipped}，失败 {len(result.failures)}"
     )
     if result.failures:
         print("失败列表：", file=sys.stderr)
@@ -878,9 +1124,9 @@ def main(argv: list[str] | None = None) -> int:
                 output_options=output_options,
                 force=args.force,
             )
-            return 1 if batch.failed else 0
+            return 1 if batch.has_issues else 0
 
-        parse_pdf(
+        output_path = parse_pdf(
             pdf_path=args.pdf,
             output_root=args.output_dir,
             use_ocr=args.use_ocr,
@@ -888,6 +1134,8 @@ def main(argv: list[str] | None = None) -> int:
             output_options=output_options,
             force=args.force,
         )
+        metadata = read_run_metadata(output_path) or {}
+        return 1 if metadata.get("result", {}).get("status") == "partial" else 0
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as error:
         print(f"错误：{error}", file=sys.stderr)
         return 1

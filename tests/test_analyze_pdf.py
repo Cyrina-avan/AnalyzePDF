@@ -7,12 +7,30 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import analyzePDF
 
 
 class AnalyzePDFStateTests(unittest.TestCase):
+    def test_error_message_removes_source_identity_paths_and_traceback(self) -> None:
+        source = Path("/Users/alice/Documents/real-identity-123.pdf")
+        message = (
+            f"cannot parse {source}: cache /private/tmp/model.bin; "
+            "mirror /Volumes/Shared/customer.pdf\n"
+            "Traceback (most recent call last): secret"
+        )
+
+        sanitized = analyzePDF.sanitize_error_message(message, source)
+
+        self.assertNotIn("alice", sanitized)
+        self.assertNotIn("real-identity-123.pdf", sanitized)
+        self.assertNotIn("/private/tmp", sanitized)
+        self.assertNotIn("/Volumes/Shared", sanitized)
+        self.assertNotIn("Traceback", sanitized)
+
     def test_skip_requires_matching_source_request_parser_and_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -172,6 +190,122 @@ class AnalyzePDFStateTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_parse_replaces_stale_outputs_with_sanitized_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "real-identity-123.pdf"
+            source.write_bytes(b"not-a-real-pdf")
+            output_root = root / "output"
+            output = analyzePDF.resolve_output_dir(source, output_root)
+            output.mkdir(parents=True)
+            (output / analyzePDF.MARKDOWN_FILENAME).write_text(
+                "# stale success\n", encoding="utf-8"
+            )
+            user_notes = output / "review-notes.txt"
+            user_notes.write_text("keep", encoding="utf-8")
+            errors = [
+                analyzePDF.classify_parse_error(
+                    RuntimeError(f"failed at {source}"), source, "docling-parse"
+                )
+            ]
+
+            with mock.patch.object(
+                analyzePDF,
+                "_convert_pdf_with_backend",
+                side_effect=analyzePDF.PDFConversionFailure(errors),
+            ):
+                with self.assertRaises(analyzePDF.PDFConversionFailure):
+                    analyzePDF.parse_pdf(source, output_root=output_root)
+
+            run = json.loads(
+                (output / analyzePDF.RUN_METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+            serialized = json.dumps(run, ensure_ascii=False)
+            self.assertEqual(run["result"]["status"], "failed")
+            self.assertEqual(run["output_files"], [])
+            self.assertNotIn(source.name, serialized)
+            self.assertNotIn(str(source), serialized)
+            self.assertFalse((output / analyzePDF.MARKDOWN_FILENAME).exists())
+            self.assertEqual(user_notes.read_text(encoding="utf-8"), "keep")
+
+    def test_complete_failure_falls_back_to_usable_partial_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.pdf"
+            source.write_bytes(b"synthetic")
+            partial = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.PARTIAL_SUCCESS,
+                document=object(),
+                errors=[RuntimeError(f"one page failed at {source}")],
+            )
+            failed = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.FAILURE,
+                document=None,
+                errors=[RuntimeError("fallback could not recover the page")],
+            )
+
+            class FakeConverter:
+                def __init__(self, result):
+                    self.result = result
+
+                def convert(self, _input_path):
+                    return self.result
+
+            with mock.patch.object(
+                analyzePDF, "create_converter", return_value=FakeConverter(failed)
+            ):
+                outcome = analyzePDF._convert_pdf_with_backend(
+                    source,
+                    use_ocr=False,
+                    converter=FakeConverter(partial),
+                )
+
+            self.assertIs(outcome.result, partial)
+            self.assertEqual(outcome.backend, "docling-parse")
+            self.assertGreaterEqual(len(outcome.errors), 2)
+            serialized = json.dumps(outcome.errors, ensure_ascii=False)
+            self.assertNotIn(source.name, serialized)
+            self.assertNotIn(str(source), serialized)
+
+    def test_table_export_error_publishes_partial_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sample.pdf"
+            source.write_bytes(b"synthetic")
+            output = root / "output"
+
+            class FailingTable:
+                def export_to_dataframe(self, doc):
+                    raise RuntimeError(f"temporary export failure for {source}")
+
+            class FakeDocument:
+                tables = [FailingTable()]
+
+                def save_as_markdown(self, path, **_kwargs):
+                    Path(path).write_text("# usable text\n", encoding="utf-8")
+
+                def export_to_dict(self):
+                    return {"schema_name": "synthetic"}
+
+            analyzePDF.write_outputs(
+                document=FakeDocument(),
+                input_path=source,
+                output_path=output,
+                options=analyzePDF.OutputOptions.full(),
+                source_sha256=analyzePDF.file_sha256(source),
+                use_ocr=False,
+                backend="docling-parse",
+                conversion_errors=(),
+                started_at=analyzePDF.datetime.now(analyzePDF.timezone.utc),
+                started_monotonic=time.monotonic(),
+            )
+
+            run = json.loads(
+                (output / analyzePDF.RUN_METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(run["result"]["status"], "partial")
+            self.assertEqual(run["errors"][0]["code"], "TABLE_EXPORT_FAILED")
+            self.assertNotIn(source.name, json.dumps(run["errors"], ensure_ascii=False))
 
 
 if __name__ == "__main__":
