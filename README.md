@@ -59,6 +59,18 @@ uv run python analyzePDF.py --input-dir pdfs --no-recursive
 uv run python analyzePDF.py your-file.pdf --use-ocr
 ```
 
+单份文档默认最多处理 300 秒。可用 `--document-timeout` 调整；超时配置会进入
+运行指纹，修改时限后不会误用旧产物。若超时时已经产生可用正文，结果记为
+`partial` 并保留内容，同时返回非零退出码：
+
+```powershell
+uv run python analyzePDF.py your-file.pdf --document-timeout 120
+```
+
+大量逐页超时提示在控制台只显示前 10 条，完整机器错误仍全部保存在 `run.json`。
+
+超时结果会受文档复杂度、硬件和当时负载影响。很短的时限只适合可控实验，不能直接当作跨机器性能标准。
+
 指定设备：
 
 ```bash

@@ -69,6 +69,7 @@ SOURCE_FILENAME = "source.txt"
 RUN_METADATA_FILENAME = "run.json"
 DEVICE_ENV_VAR = "ANALYZEPDF_DEVICE"
 OUTPUT_STATE_VERSION = 1
+DEFAULT_DOCUMENT_TIMEOUT_SECONDS = 300.0
 
 
 def package_version(package: str, fallback: str = "unknown") -> str:
@@ -282,9 +283,14 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def output_request(use_ocr: bool, options: OutputOptions) -> dict[str, Any]:
+def output_request(
+    use_ocr: bool,
+    options: OutputOptions,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     return {
         "use_ocr": use_ocr,
+        "document_timeout_seconds": document_timeout_seconds,
         "output_options": asdict(options),
     }
 
@@ -358,6 +364,19 @@ def classify_parse_error(error: object, input_path: Path, backend: str) -> dict[
         retryable=retryable,
         input_path=input_path,
     )
+
+
+def print_conversion_errors(errors: list[Any], *, limit: int = 10) -> None:
+    """Keep console output readable while run.json retains every machine error."""
+
+    if not errors:
+        return
+    print("转换过程中有以下提示：")
+    for error in errors[:limit]:
+        print(f"- {error}")
+    remaining = len(errors) - limit
+    if remaining > 0:
+        print(f"- 其余 {remaining} 条提示已省略，完整记录见 run.json")
 
 
 def read_run_metadata(output_dir: Path) -> dict[str, Any] | None:
@@ -445,6 +464,7 @@ def should_skip_existing(
     use_ocr: bool = False,
     output_options: OutputOptions | None = None,
     source_sha256: str | None = None,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> bool:
     """仅当源内容、解析代码、请求配置和全部产物仍一致时跳过。"""
 
@@ -470,7 +490,9 @@ def should_skip_existing(
         return False
     if metadata.get("parser", {}).get("source_sha256") != parser_hash:
         return False
-    if metadata.get("request") != output_request(use_ocr, options):
+    if metadata.get("request") != output_request(
+        use_ocr, options, document_timeout_seconds
+    ):
         return False
     if metadata.get("result", {}).get("status") != "succeeded":
         return False
@@ -482,6 +504,7 @@ def create_converter(
     backend: type = DoclingParseDocumentBackend,
     device: AcceleratorDevice | None = None,
     output_options: OutputOptions | None = None,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> DocumentConverter:
     accelerator_device = device or resolve_accelerator_device()
     options = output_options or OutputOptions.full()
@@ -492,7 +515,7 @@ def create_converter(
         ocr_options=RapidOcrOptions(backend="torch"),
         ocr_batch_size=8,
         layout_batch_size=8,
-        document_timeout=300,
+        document_timeout=document_timeout_seconds,
         generate_picture_images=options.export_images,
         images_scale=options.images_scale,
     )
@@ -513,6 +536,7 @@ def convert_pdf(
     converter: DocumentConverter | None = None,
     device: AcceleratorDevice | None = None,
     output_options: OutputOptions | None = None,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ):
     """先用默认解析器，失败时自动切换到 pypdfium2。"""
 
@@ -522,6 +546,7 @@ def convert_pdf(
         converter=converter,
         device=device,
         output_options=output_options,
+        document_timeout_seconds=document_timeout_seconds,
     ).result
 
 
@@ -531,6 +556,7 @@ def _convert_pdf_with_backend(
     converter: DocumentConverter | None = None,
     device: AcceleratorDevice | None = None,
     output_options: OutputOptions | None = None,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> ConversionOutcome:
     """Prefer a complete result, but preserve a usable partial result."""
 
@@ -556,6 +582,7 @@ def _convert_pdf_with_backend(
                     backend=backend,
                     device=device,
                     output_options=output_options,
+                    document_timeout_seconds=document_timeout_seconds,
                 )
             conversion_result = active_converter.convert(input_path)
         except Exception as error:
@@ -576,7 +603,17 @@ def _convert_pdf_with_backend(
             for error in status_errors
         ]
         if conversion_result.status == ConversionStatus.PARTIAL_SUCCESS:
-            records = [{**record, "code": "PDF_PARTIAL_PARSE"} for record in records]
+            records = [
+                {
+                    **record,
+                    "code": (
+                        "PARSE_TIMEOUT"
+                        if record["code"] == "PARSE_TIMEOUT"
+                        else "PDF_PARTIAL_PARSE"
+                    ),
+                }
+                for record in records
+            ]
         if (
             conversion_result.status == ConversionStatus.PARTIAL_SUCCESS
             and conversion_result.document is not None
@@ -647,6 +684,7 @@ def write_run_metadata(
     errors: list[dict[str, Any]],
     started_at: datetime,
     started_monotonic: float,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> None:
     completed_at = datetime.now(timezone.utc)
     run_metadata = {
@@ -663,7 +701,7 @@ def write_run_metadata(
             "backend": backend,
             "source_sha256": file_sha256(Path(__file__).resolve()),
         },
-        "request": output_request(use_ocr, options),
+        "request": output_request(use_ocr, options, document_timeout_seconds),
         "result": {
             "status": status,
             "started_at": started_at.isoformat().replace("+00:00", "Z"),
@@ -690,6 +728,7 @@ def publish_failed_run(
     errors: list[dict[str, Any]],
     started_at: datetime,
     started_monotonic: float,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> None:
     """Replace stale managed outputs with one durable failed-run record."""
 
@@ -706,6 +745,7 @@ def publish_failed_run(
         errors=errors,
         started_at=started_at,
         started_monotonic=started_monotonic,
+        document_timeout_seconds=document_timeout_seconds,
     )
 
 
@@ -721,6 +761,7 @@ def write_outputs(
     conversion_errors: tuple[dict[str, Any], ...],
     started_at: datetime,
     started_monotonic: float,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> None:
     """Write complete or usable partial outputs, followed by durable metadata."""
 
@@ -799,6 +840,7 @@ def write_outputs(
         errors=run_errors,
         started_at=started_at,
         started_monotonic=started_monotonic,
+        document_timeout_seconds=document_timeout_seconds,
     )
 
     if status == "partial":
@@ -825,6 +867,7 @@ def parse_pdf(
     output_options: OutputOptions | None = None,
     input_root: str | Path | None = None,
     force: bool = False,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> Path:
     """
     使用 Docling 解析 PDF，并按需输出：
@@ -850,6 +893,7 @@ def parse_pdf(
         use_ocr=use_ocr,
         output_options=options,
         source_sha256=source_content_sha256,
+        document_timeout_seconds=document_timeout_seconds,
     ):
         print(f"已存在且 source 匹配，跳过：{output_path / MARKDOWN_FILENAME}")
         return output_path
@@ -859,6 +903,7 @@ def parse_pdf(
     if output_name != sanitize_path_component(input_path.stem):
         print(f"输出名称：{output_name}（已按路径去重/缩短）")
     print(f"OCR：{'开启' if use_ocr else '关闭（使用 PDF 内嵌文字，更快）'}")
+    print(f"文档处理时限：{document_timeout_seconds} 秒")
     print(
         "导出："
         f"json={'开' if options.write_json else '关'} / "
@@ -875,6 +920,7 @@ def parse_pdf(
             converter=converter,
             device=device,
             output_options=options,
+            document_timeout_seconds=document_timeout_seconds,
         )
     except PDFConversionFailure as error:
         publish_failed_run(
@@ -887,6 +933,7 @@ def parse_pdf(
             errors=list(error.errors),
             started_at=started_at,
             started_monotonic=started_monotonic,
+            document_timeout_seconds=document_timeout_seconds,
         )
         raise
     conversion_result = outcome.result
@@ -911,14 +958,12 @@ def parse_pdf(
             errors=errors,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            document_timeout_seconds=document_timeout_seconds,
         )
         raise RuntimeError("PDF 解析未生成文档")
 
     print(f"转换状态：{conversion_result.status}")
-    if conversion_result.errors:
-        print("转换过程中有以下提示：")
-        for error in conversion_result.errors:
-            print(f"- {error}")
+    print_conversion_errors(list(conversion_result.errors or []))
 
     try:
         write_outputs(
@@ -932,24 +977,46 @@ def parse_pdf(
             conversion_errors=outcome.errors,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            document_timeout_seconds=document_timeout_seconds,
         )
     except EmptyTextOutputError:
-        if use_ocr:
+        timeout_errors = [
+            dict(error)
+            for error in outcome.errors
+            if error.get("code") == "PARSE_TIMEOUT"
+        ]
+        if timeout_errors:
+            errors = timeout_errors
+            failure_message = "文档处理超时，尚未生成可用正文"
+        elif outcome.errors:
+            errors = [dict(error) for error in outcome.errors]
+            failure_message = "部分解析结束，但未生成可用正文"
+        elif use_ocr:
             code = "OCR_EMPTY_OUTPUT"
             message = "OCR completed without producing usable text"
             retryable = False
+            errors = [
+                error_record(
+                    code=code,
+                    stage="quality",
+                    message=message,
+                    retryable=retryable,
+                )
+            ]
+            failure_message = "OCR 未生成可用正文"
         else:
             code = "OCR_REQUIRED"
             message = "Parser produced no usable text; rerun with OCR enabled"
             retryable = True
-        errors = [
-            error_record(
-                code=code,
-                stage="quality",
-                message=message,
-                retryable=retryable,
-            )
-        ]
+            errors = [
+                error_record(
+                    code=code,
+                    stage="quality",
+                    message=message,
+                    retryable=retryable,
+                )
+            ]
+            failure_message = "PDF 没有可用正文，请开启 OCR 后重试"
         publish_failed_run(
             input_path=input_path,
             output_path=output_path,
@@ -960,10 +1027,9 @@ def parse_pdf(
             errors=errors,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            document_timeout_seconds=document_timeout_seconds,
         )
-        if use_ocr:
-            raise RuntimeError("OCR 未生成可用正文") from None
-        raise RuntimeError("PDF 没有可用正文，请开启 OCR 后重试") from None
+        raise RuntimeError(failure_message) from None
     except Exception as error:
         errors = [
             error_record(
@@ -984,6 +1050,7 @@ def parse_pdf(
             errors=errors,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            document_timeout_seconds=document_timeout_seconds,
         )
         raise
     return output_path
@@ -997,6 +1064,7 @@ def parse_pdf_batch(
     device: AcceleratorDevice | None = None,
     output_options: OutputOptions | None = None,
     force: bool = False,
+    document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> BatchResult:
     options = output_options or OutputOptions.full()
     accelerator = device or resolve_accelerator_device()
@@ -1006,6 +1074,7 @@ def parse_pdf_batch(
         use_ocr=use_ocr,
         device=accelerator,
         output_options=options,
+        document_timeout_seconds=document_timeout_seconds,
     )
     result = BatchResult()
 
@@ -1020,6 +1089,7 @@ def parse_pdf_batch(
             force=force,
             use_ocr=use_ocr,
             output_options=options,
+            document_timeout_seconds=document_timeout_seconds,
         ):
             print(f"已存在且 source 匹配，跳过：{output_dir / MARKDOWN_FILENAME}")
             result.output_dirs.append(output_dir)
@@ -1035,6 +1105,7 @@ def parse_pdf_batch(
                 output_options=options,
                 input_root=input_root,
                 force=force,
+                document_timeout_seconds=document_timeout_seconds,
             )
             result.output_dirs.append(parsed_output)
             metadata = read_run_metadata(parsed_output) or {}
@@ -1085,6 +1156,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "cpu", "cuda", "gpu", "mps", "xpu"],
         default=None,
         help="加速设备，默认读 ANALYZEPDF_DEVICE，再不行用 auto",
+    )
+    parser.add_argument(
+        "--document-timeout",
+        type=float,
+        default=DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
+        help="单份文档最大处理秒数，默认 300；超时应保留可用部分并返回非零退出码",
     )
     parser.add_argument(
         "--no-recursive",
@@ -1146,6 +1223,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.pdf and not args.input_dir:
         parser.error("请提供 PDF 文件路径，或使用 --input-dir 指定文件夹。")
+    if args.document_timeout <= 0:
+        parser.error("--document-timeout 必须大于 0。")
 
     try:
         device = resolve_accelerator_device(args.device)
@@ -1161,6 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
                 device=device,
                 output_options=output_options,
                 force=args.force,
+                document_timeout_seconds=args.document_timeout,
             )
             return 1 if batch.has_issues else 0
 
@@ -1171,6 +1251,7 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             output_options=output_options,
             force=args.force,
+            document_timeout_seconds=args.document_timeout,
         )
         metadata = read_run_metadata(output_path) or {}
         return 1 if metadata.get("result", {}).get("status") == "partial" else 0

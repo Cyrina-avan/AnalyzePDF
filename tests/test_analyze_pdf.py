@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,19 @@ import analyzePDF
 
 
 class AnalyzePDFStateTests(unittest.TestCase):
+    def test_conversion_error_console_output_is_bounded(self) -> None:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            analyzePDF.print_conversion_errors(
+                [f"page {index} timeout" for index in range(12)], limit=3
+            )
+
+        output = buffer.getvalue()
+        self.assertIn("page 0 timeout", output)
+        self.assertIn("page 2 timeout", output)
+        self.assertNotIn("page 3 timeout", output)
+        self.assertIn("其余 9 条提示已省略", output)
+
     def test_error_message_removes_source_identity_paths_and_traceback(self) -> None:
         source = Path("/Users/alice/Documents/real-identity-123.pdf")
         message = (
@@ -79,6 +94,16 @@ class AnalyzePDFStateTests(unittest.TestCase):
                     use_ocr=False,
                     output_options=options,
                     source_sha256=source_hash,
+                )
+            )
+            self.assertFalse(
+                analyzePDF.should_skip_existing(
+                    source,
+                    output,
+                    use_ocr=False,
+                    output_options=options,
+                    source_sha256=source_hash,
+                    document_timeout_seconds=1.0,
                 )
             )
             self.assertFalse(
@@ -355,6 +380,94 @@ class AnalyzePDFStateTests(unittest.TestCase):
             self.assertFalse((output / analyzePDF.MARKDOWN_FILENAME).exists())
             self.assertNotIn(source.name, serialized)
             self.assertNotIn(str(source), serialized)
+
+    def test_timeout_without_text_keeps_timeout_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "digital-text.pdf"
+            source.write_bytes(b"synthetic")
+            output_root = root / "output"
+
+            class EmptyDocument:
+                tables = []
+
+                def save_as_markdown(self, path, **_kwargs):
+                    Path(path).write_text("", encoding="utf-8")
+
+            conversion = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.PARTIAL_SUCCESS,
+                document=EmptyDocument(),
+                errors=[],
+            )
+            timeout_error = analyzePDF.error_record(
+                code="PARSE_TIMEOUT",
+                stage="parse",
+                message="Document timeout before usable text",
+                retryable=True,
+            )
+            outcome = analyzePDF.ConversionOutcome(
+                result=conversion,
+                backend="pypdfium2",
+                errors=(timeout_error,),
+            )
+
+            with mock.patch.object(
+                analyzePDF, "_convert_pdf_with_backend", return_value=outcome
+            ):
+                with self.assertRaisesRegex(RuntimeError, "处理超时"):
+                    analyzePDF.parse_pdf(
+                        source,
+                        output_root=output_root,
+                        use_ocr=False,
+                        document_timeout_seconds=0.1,
+                    )
+
+            output = analyzePDF.resolve_output_dir(source, output_root)
+            run = json.loads(
+                (output / analyzePDF.RUN_METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(run["result"]["status"], "failed")
+            self.assertEqual(run["errors"][0]["code"], "PARSE_TIMEOUT")
+            self.assertTrue(run["errors"][0]["retryable"])
+            self.assertNotIn("OCR_REQUIRED", json.dumps(run, ensure_ascii=False))
+
+    def test_partial_timeout_preserves_retryable_timeout_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.pdf"
+            source.write_bytes(b"synthetic")
+            partial = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.PARTIAL_SUCCESS,
+                document=object(),
+                errors=[RuntimeError("Document timeout after 0.5 seconds")],
+            )
+            failed = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.FAILURE,
+                document=None,
+                errors=[RuntimeError("fallback could not recover the page")],
+            )
+
+            class FakeConverter:
+                def __init__(self, result):
+                    self.result = result
+
+                def convert(self, _input_path):
+                    return self.result
+
+            with mock.patch.object(
+                analyzePDF, "create_converter", return_value=FakeConverter(failed)
+            ):
+                outcome = analyzePDF._convert_pdf_with_backend(
+                    source,
+                    use_ocr=False,
+                    converter=FakeConverter(partial),
+                    document_timeout_seconds=0.5,
+                )
+
+            timeout_errors = [
+                error for error in outcome.errors if error["code"] == "PARSE_TIMEOUT"
+            ]
+            self.assertEqual(len(timeout_errors), 1)
+            self.assertTrue(timeout_errors[0]["retryable"])
 
 
 if __name__ == "__main__":
