@@ -309,6 +309,53 @@ class AnalyzePDFStateTests(unittest.TestCase):
             self.assertEqual(run["errors"][0]["code"], "TABLE_EXPORT_FAILED")
             self.assertNotIn(source.name, json.dumps(run["errors"], ensure_ascii=False))
 
+    def test_empty_markdown_without_ocr_requests_ocr_and_fails_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "image-only.pdf"
+            source.write_bytes(b"synthetic")
+            output_root = root / "output"
+
+            class EmptyDocument:
+                tables = []
+
+                def save_as_markdown(self, path, **_kwargs):
+                    Path(path).write_text("\n  \n", encoding="utf-8")
+
+                def export_to_dict(self):
+                    return {"schema_name": "synthetic"}
+
+            conversion = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.SUCCESS,
+                document=EmptyDocument(),
+                errors=[],
+            )
+
+            class FakeConverter:
+                def convert(self, _input_path):
+                    return conversion
+
+            with self.assertRaisesRegex(RuntimeError, "开启 OCR"):
+                analyzePDF.parse_pdf(
+                    source,
+                    output_root=output_root,
+                    converter=FakeConverter(),
+                    use_ocr=False,
+                )
+
+            output = analyzePDF.resolve_output_dir(source, output_root)
+            run = json.loads(
+                (output / analyzePDF.RUN_METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+            serialized = json.dumps(run, ensure_ascii=False)
+            self.assertEqual(run["result"]["status"], "failed")
+            self.assertEqual(run["errors"][0]["code"], "OCR_REQUIRED")
+            self.assertTrue(run["errors"][0]["retryable"])
+            self.assertEqual(run["output_files"], [])
+            self.assertFalse((output / analyzePDF.MARKDOWN_FILENAME).exists())
+            self.assertNotIn(source.name, serialized)
+            self.assertNotIn(str(source), serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

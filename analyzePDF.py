@@ -138,6 +138,10 @@ class PDFConversionFailure(RuntimeError):
         self.errors = tuple(errors)
 
 
+class EmptyTextOutputError(RuntimeError):
+    """Raised when a parser reports success but exports no usable text."""
+
+
 def resolve_accelerator_device(device: str | None = None) -> AcceleratorDevice:
     """
     解析加速设备：
@@ -744,6 +748,9 @@ def write_outputs(
         )
         artifacts_dir = None
 
+    if not markdown_path.read_text(encoding="utf-8").strip():
+        raise EmptyTextOutputError("Parser exported an empty Markdown document")
+
     (output_path / SOURCE_FILENAME).write_text(
         f"{input_path.name}\nsha256:{source_sha256}\n",
         encoding="utf-8",
@@ -926,6 +933,37 @@ def parse_pdf(
             started_at=started_at,
             started_monotonic=started_monotonic,
         )
+    except EmptyTextOutputError:
+        if use_ocr:
+            code = "OCR_EMPTY_OUTPUT"
+            message = "OCR completed without producing usable text"
+            retryable = False
+        else:
+            code = "OCR_REQUIRED"
+            message = "Parser produced no usable text; rerun with OCR enabled"
+            retryable = True
+        errors = [
+            error_record(
+                code=code,
+                stage="quality",
+                message=message,
+                retryable=retryable,
+            )
+        ]
+        publish_failed_run(
+            input_path=input_path,
+            output_path=output_path,
+            options=options,
+            source_sha256=source_content_sha256,
+            use_ocr=use_ocr,
+            backend=outcome.backend,
+            errors=errors,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+        )
+        if use_ocr:
+            raise RuntimeError("OCR 未生成可用正文") from None
+        raise RuntimeError("PDF 没有可用正文，请开启 OCR 后重试") from None
     except Exception as error:
         errors = [
             error_record(

@@ -116,6 +116,7 @@ output/
 断点续跑：仅当状态为 `succeeded`，且源内容 SHA-256、解析脚本 SHA-256、OCR/输出配置和全部产物哈希均匹配时才跳过；`partial` / `failed` 会在下次运行时重新处理。旧版输出没有 `run.json`，首次会自动重转。仍可用 `--force` 强制重转。
 重新解析会先清理本工具管理的旧 Markdown、JSON、表格、图片和运行元数据，避免输出配置变化后残留过期 Artifact；输出目录中的其他用户文件不会被删除。
 解析失败仍会发布仅含源内容哈希、请求指纹、处理时间和去敏机器错误的 `run.json`；不会把源文件名、绝对路径或 traceback 写入运行记录。若 Docling 返回可用文档但状态为 `PARTIAL_SUCCESS`，或个别表格导出失败，则保留可用输出并将运行状态记为 `partial`。
+如果解析后 Markdown 正文为空，即使底层解析器声称成功也会改记为 `failed` 并清除空产物。未开启 OCR 时错误码为 `OCR_REQUIRED`，提示用 `--use-ocr` 重试；开启 OCR 后仍为空则记为 `OCR_EMPTY_OUTPUT`。
 单个文件失败不中断整批；若存在部分成功或失败，进程退出码为 `1`。
 
 部分异常 PDF 会自动改用 `pypdfium2`。
