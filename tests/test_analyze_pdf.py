@@ -381,6 +381,77 @@ class AnalyzePDFStateTests(unittest.TestCase):
             self.assertNotIn(source.name, serialized)
             self.assertNotIn(str(source), serialized)
 
+    def test_successful_fallback_keeps_diagnostics_without_marking_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sample.pdf"
+            source.write_bytes(b"synthetic")
+            output = root / "output"
+            failed = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.FAILURE,
+                document=None,
+                errors=[RuntimeError("primary backend unavailable")],
+            )
+
+            class FakeDocument:
+                tables = []
+
+                def save_as_markdown(self, path, **_kwargs):
+                    Path(path).write_text("# usable fallback text\n", encoding="utf-8")
+
+                def export_to_dict(self):
+                    return {"schema_name": "synthetic"}
+
+            succeeded = SimpleNamespace(
+                status=analyzePDF.ConversionStatus.SUCCESS,
+                document=FakeDocument(),
+                errors=[],
+            )
+
+            class FakeConverter:
+                def __init__(self, result):
+                    self.result = result
+
+                def convert(self, _input_path):
+                    return self.result
+
+            with mock.patch.object(
+                analyzePDF, "create_converter", return_value=FakeConverter(succeeded)
+            ):
+                outcome = analyzePDF._convert_pdf_with_backend(
+                    source,
+                    use_ocr=False,
+                    converter=FakeConverter(failed),
+                )
+
+            self.assertEqual(outcome.backend, "pypdfium2")
+            self.assertEqual(outcome.errors, ())
+            self.assertTrue(outcome.diagnostics)
+            analyzePDF.write_outputs(
+                document=outcome.result.document,
+                input_path=source,
+                output_path=output,
+                options=analyzePDF.OutputOptions.full(),
+                source_sha256=analyzePDF.file_sha256(source),
+                use_ocr=False,
+                backend=outcome.backend,
+                conversion_errors=outcome.errors,
+                backend_diagnostics=outcome.diagnostics,
+                started_at=analyzePDF.datetime.now(analyzePDF.timezone.utc),
+                started_monotonic=time.monotonic(),
+            )
+            run = json.loads(
+                (output / analyzePDF.RUN_METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(run["result"]["status"], "succeeded")
+            self.assertTrue(run["parser"]["diagnostics"])
+            self.assertEqual(run["errors"], [])
+            serialized_diagnostics = json.dumps(
+                run["parser"]["diagnostics"], ensure_ascii=False
+            )
+            self.assertNotIn(source.name, serialized_diagnostics)
+            self.assertNotIn(str(source), serialized_diagnostics)
+
     def test_timeout_without_text_keeps_timeout_classification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

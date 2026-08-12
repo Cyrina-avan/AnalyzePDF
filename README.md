@@ -71,6 +71,8 @@ uv run python analyzePDF.py your-file.pdf --document-timeout 120
 
 超时结果会受文档复杂度、硬件和当时负载影响。很短的时限只适合可控实验，不能直接当作跨机器性能标准。
 
+在 Windows 上，`docling-parse` 使用原生组件读取 PDF。当前已验证的版本在虚拟环境或源 PDF 路径含非 ASCII 字符（例如中文目录名）时可能无法读取本应存在的资源或源文件。AnalyzePDF 会继续使用 `pypdfium2` 备用方法，并把主方法的去敏诊断保存在 `run.json` 的 `parser.diagnostics` 中；成功的备用解析不会因此被误标为部分成功。需要验证主方法时，应让 uv 虚拟环境与待测 PDF 都位于纯英文路径。仓库文档不得记录具体本机路径。
+
 指定设备：
 
 ```bash

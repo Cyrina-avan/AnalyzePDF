@@ -54,6 +54,7 @@ configure_hf_hub()
 # Windows 下 HuggingFace 缓存不支持符号链接，这条警告可以忽略
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
+import docling_parse
 from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
@@ -124,11 +125,12 @@ class BatchResult:
 
 @dataclass(frozen=True)
 class ConversionOutcome:
-    """Docling 结果、实际 backend 与可公开的降级错误。"""
+    """Docling 结果、实际 backend、结果错误与非致命后端诊断。"""
 
     result: Any
     backend: str
     errors: tuple[dict[str, Any], ...] = ()
+    diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 class PDFConversionFailure(RuntimeError):
@@ -366,6 +368,38 @@ def classify_parse_error(error: object, input_path: Path, backend: str) -> dict[
     )
 
 
+def primary_backend_path_diagnostics(input_path: Path) -> tuple[dict[str, Any], ...]:
+    """Report Windows native-parser path risks without recording the paths themselves."""
+
+    if os.name != "nt":
+        return ()
+    package_file = getattr(docling_parse, "__file__", None)
+    checks = (
+        (
+            "NATIVE_RUNTIME_PATH_NON_ASCII",
+            Path(package_file).resolve() if package_file else None,
+            "Windows 原生解析器运行路径包含非 ASCII 字符",
+        ),
+        (
+            "SOURCE_PATH_NON_ASCII",
+            input_path.resolve(),
+            "Windows 原生解析器源文件路径包含非 ASCII 字符",
+        ),
+    )
+    records: list[dict[str, Any]] = []
+    for code, path, message in checks:
+        if path is not None and not str(path).isascii():
+            records.append(
+                error_record(
+                    code=code,
+                    stage="input",
+                    message=message,
+                    retryable=False,
+                )
+            )
+    return tuple(records)
+
+
 def print_conversion_errors(errors: list[Any], *, limit: int = 10) -> None:
     """Keep console output readable while run.json retains every machine error."""
 
@@ -566,6 +600,7 @@ def _convert_pdf_with_backend(
     ]
 
     attempt_errors: list[dict[str, Any]] = []
+    path_diagnostics = primary_backend_path_diagnostics(input_path)
     partial_outcome: ConversionOutcome | None = None
 
     for backend_name, shared_converter in attempts:
@@ -593,7 +628,15 @@ def _convert_pdf_with_backend(
         if conversion_result.status == ConversionStatus.SUCCESS:
             if backend_name != "docling-parse":
                 print(f"已切换到备用解析器：{backend_name}")
-            return ConversionOutcome(result=conversion_result, backend=backend_name)
+            return ConversionOutcome(
+                result=conversion_result,
+                backend=backend_name,
+                diagnostics=(
+                    tuple((*path_diagnostics, *attempt_errors))
+                    if backend_name != "docling-parse"
+                    else ()
+                ),
+            )
 
         status_errors = list(conversion_result.errors or [])
         if not status_errors:
@@ -633,6 +676,7 @@ def _convert_pdf_with_backend(
             result=partial_outcome.result,
             backend=partial_outcome.backend,
             errors=tuple(attempt_errors),
+            diagnostics=path_diagnostics,
         )
 
     if not attempt_errors:
@@ -684,6 +728,7 @@ def write_run_metadata(
     errors: list[dict[str, Any]],
     started_at: datetime,
     started_monotonic: float,
+    backend_diagnostics: tuple[dict[str, Any], ...] = (),
     document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> None:
     completed_at = datetime.now(timezone.utc)
@@ -699,6 +744,7 @@ def write_run_metadata(
             "engine_name": "docling",
             "engine_version": ENGINE_VERSION,
             "backend": backend,
+            "diagnostics": list(backend_diagnostics),
             "source_sha256": file_sha256(Path(__file__).resolve()),
         },
         "request": output_request(use_ocr, options, document_timeout_seconds),
@@ -761,6 +807,7 @@ def write_outputs(
     conversion_errors: tuple[dict[str, Any], ...],
     started_at: datetime,
     started_monotonic: float,
+    backend_diagnostics: tuple[dict[str, Any], ...] = (),
     document_timeout_seconds: float | None = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
 ) -> None:
     """Write complete or usable partial outputs, followed by durable metadata."""
@@ -840,6 +887,7 @@ def write_outputs(
         errors=run_errors,
         started_at=started_at,
         started_monotonic=started_monotonic,
+        backend_diagnostics=backend_diagnostics,
         document_timeout_seconds=document_timeout_seconds,
     )
 
@@ -977,6 +1025,7 @@ def parse_pdf(
             conversion_errors=outcome.errors,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            backend_diagnostics=outcome.diagnostics,
             document_timeout_seconds=document_timeout_seconds,
         )
     except EmptyTextOutputError:
