@@ -1,0 +1,35 @@
+[project]
+name = "analyzepdf-runtime-mineru"
+version = "0.0.0"
+description = "AnalyzePDF 的 MinerU 独立备用解析环境。"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mineru[all]==3.4.4",
+  "nvidia-cublas-cu12>=12.8,<13",
+  "nvidia-cuda-cupti-cu12>=12.8,<13",
+  "nvidia-cuda-nvrtc-cu12>=12.8,<13",
+  "nvidia-cuda-runtime-cu12>=12.8,<13",
+  "nvidia-cudnn-cu12>=9,<10",
+  "nvidia-cufft-cu12>=11,<12",
+  "nvidia-curand-cu12>=10,<11",
+  "nvidia-cusolver-cu12>=11,<12",
+  "nvidia-cusparse-cu12>=12,<13",
+  "nvidia-nvjitlink-cu12>=12.8,<13",
+  "nvidia-nvtx-cu12>=12,<13",
+  "torch==2.8.0",
+  "torchvision==0.23.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.uv]
+override-dependencies = [
+  "nvidia-nccl-cu12; sys_platform == 'linux'",
+]

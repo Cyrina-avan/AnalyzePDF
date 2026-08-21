@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-import analyzePDF
+from analyzepdf.parsers import docling as analyzePDF
 
 
 class AnalyzePDFStateTests(unittest.TestCase):
@@ -200,14 +200,15 @@ class AnalyzePDFStateTests(unittest.TestCase):
         env.pop(analyzePDF.USE_HF_MIRROR_ENV_VAR, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         command = (
-            "import os; import analyzePDF; import huggingface_hub.constants as c; "
+            "import os; from analyzepdf.parsers import docling as analyzePDF; "
+            "import huggingface_hub.constants as c; "
             "assert os.environ.get('HF_ENDPOINT') is None; "
             "assert c.ENDPOINT != 'https://example.invalid'"
         )
 
         result = subprocess.run(
             [sys.executable, "-c", command],
-            cwd=Path(analyzePDF.__file__).resolve().parent,
+            cwd=Path(__file__).resolve().parents[1],
             env=env,
             capture_output=True,
             text=True,

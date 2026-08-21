@@ -1,13 +1,40 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "analyzepdf"
-version = "0.1.0"
-description = "使用 Docling 解析 PDF，导出 Markdown、JSON 和表格 CSV"
-requires-python = ">=3.12"
+version = "0.2.0"
+description = "独立的企业文档解析边界：解析、质量判断、路线选择与统一结果输出"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "docling>=2.112.0",
+    "pypdf>=6.10,<7",
     "torch",
     "torchvision",
 ]
+
+[project.scripts]
+analyzepdf-contract-docling = "analyzepdf.contracts.docling:main"
+analyzepdf-contract-mineru = "analyzepdf.contracts.mineru:main"
+analyzepdf-contract-ppstructure = "analyzepdf.contracts.ppstructure:main"
+analyzepdf-native-text = "analyzepdf.native_text:main"
+analyzepdf-pipeline = "analyzepdf.pipeline:main"
+analyzepdf-quality = "analyzepdf.quality:main"
+
+[dependency-groups]
+dev = [
+    "Pillow>=12.2,<13",
+    "pypdfium2>=5.11,<6",
+    "pytest>=8",
+    "reportlab>=4.4,<5",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
