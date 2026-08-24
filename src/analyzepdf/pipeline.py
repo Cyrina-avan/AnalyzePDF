@@ -12,12 +12,14 @@ from typing import Any, Callable
 
 from analyzepdf.contracts.docling import adapt_analyzepdf_output
 from analyzepdf.contracts.mineru import adapt_mineru_output
+from analyzepdf.native_labels import extract_native_label_evidence
 from analyzepdf.native_text import extract_native_text_evidence
+from analyzepdf.page_visual import extract_page_visual_evidence
 from analyzepdf.quality import assess_ingestion_quality
 from analyzepdf.routing import QualityAssessor, RoutingDecision, route_with_fallback
 
 
-ROUTING_VERSION = 1
+ROUTING_VERSION = 2
 
 
 class PipelineError(RuntimeError):
@@ -57,6 +59,18 @@ def run_pipeline(
         extract_native_text_evidence(
             source_path,
             staging / "native-text-evidence.json",
+            document_id=document_id,
+            source_ref=source_ref,
+        )
+        extract_native_label_evidence(
+            source_path,
+            staging / "native-label-evidence.json",
+            document_id=document_id,
+            source_ref=source_ref,
+        )
+        extract_page_visual_evidence(
+            source_path,
+            staging / "page-visual-evidence",
             document_id=document_id,
             source_ref=source_ref,
         )
@@ -202,13 +216,19 @@ def _routing_payload(decision: RoutingDecision, staging: Path) -> dict[str, Any]
         "selected_route": decision.selected_route,
         "selected_contract": selected_contract,
         "native_text_evidence": "native-text-evidence.json",
+        "native_label_evidence": "native-label-evidence.json",
+        "page_visual_evidence": "page-visual-evidence/manifest.json",
         "attempts": [
             {
                 "route": attempt.route,
                 "completed": attempt.completed,
                 "contract": _relative_contract(attempt.contract_path, staging),
                 "quality_decision": attempt.quality_decision,
+                "route_action": attempt.route_action,
                 "reason_codes": list(attempt.reason_codes),
+                "warning_codes": list(attempt.warning_codes),
+                "blocking_codes": list(attempt.blocking_codes),
+                "failure_stages": list(attempt.failure_stages),
                 "failure_code": attempt.failure_code,
             }
             for attempt in decision.attempts

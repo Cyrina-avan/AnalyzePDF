@@ -9,7 +9,9 @@ description = "独立的企业文档解析边界：解析、质量判断、路�
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "docling>=2.112.0",
+    "Pillow>=12.2,<13",
     "pypdf>=6.10,<7",
+    "pypdfium2>=5.11,<6",
     "torch",
     "torchvision",
 ]
@@ -24,8 +26,6 @@ analyzepdf-quality = "analyzepdf.quality:main"
 
 [dependency-groups]
 dev = [
-    "Pillow>=12.2,<13",
-    "pypdfium2>=5.11,<6",
     "pytest>=8",
     "reportlab>=4.4,<5",
 ]

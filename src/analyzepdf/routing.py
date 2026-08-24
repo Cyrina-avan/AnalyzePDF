@@ -21,7 +21,11 @@ class RouteAttempt:
     completed: bool
     contract_path: Path | None
     quality_decision: str | None
+    route_action: str | None
     reason_codes: tuple[str, ...]
+    warning_codes: tuple[str, ...]
+    blocking_codes: tuple[str, ...]
+    failure_stages: tuple[str, ...]
     failure_code: str | None = None
 
 
@@ -42,7 +46,7 @@ def route_with_fallback(
     fallback_runner: ParserRunner,
     assessor: QualityAssessor = assess_ingestion_quality,
 ) -> RoutingDecision:
-    """先运行 Docling；结果不是 accept 时自动运行 MinerU。
+    """先运行 Docling；质量结果要求 fallback 时才运行 MinerU。
 
     解析器自身的异常不会直接泄漏到上层。详细诊断留在各路线自己的
     ``run.json`` 中；本层只记录稳定错误码，避免路线选择和底层实现耦合。
@@ -56,7 +60,7 @@ def route_with_fallback(
         assessor=assessor,
     )
     attempts.append(primary)
-    if primary.quality_decision == "accept":
+    if primary.route_action == "publish":
         return RoutingDecision(
             status="selected_primary",
             selected_route="docling",
@@ -71,7 +75,7 @@ def route_with_fallback(
         assessor=assessor,
     )
     attempts.append(fallback)
-    if fallback.quality_decision == "accept":
+    if fallback.route_action == "publish":
         return RoutingDecision(
             status="selected_fallback",
             selected_route="mineru",
@@ -102,7 +106,11 @@ def _run_and_assess(
             completed=False,
             contract_path=None,
             quality_decision=None,
+            route_action=None,
             reason_codes=(),
+            warning_codes=(),
+            blocking_codes=(),
+            failure_stages=(),
             failure_code="PARSER_RUN_FAILED",
         )
 
@@ -114,7 +122,11 @@ def _run_and_assess(
             completed=True,
             contract_path=contract_path,
             quality_decision=None,
+            route_action=None,
             reason_codes=(),
+            warning_codes=(),
+            blocking_codes=(),
+            failure_stages=(),
             failure_code="QUALITY_ASSESSMENT_FAILED",
         )
 
@@ -125,19 +137,72 @@ def _run_and_assess(
             completed=True,
             contract_path=contract_path,
             quality_decision=None,
+            route_action=None,
             reason_codes=(),
+            warning_codes=(),
+            blocking_codes=(),
+            failure_stages=(),
             failure_code="INVALID_QUALITY_DECISION",
         )
-    reason_codes = quality.get("reason_codes", [])
-    if not isinstance(reason_codes, list) or not all(
-        isinstance(item, str) for item in reason_codes
+    route_action = quality.get("route_action")
+    if route_action not in {"publish", "fallback"}:
+        return RouteAttempt(
+            route=route,
+            completed=True,
+            contract_path=contract_path,
+            quality_decision=None,
+            route_action=None,
+            reason_codes=(),
+            warning_codes=(),
+            blocking_codes=(),
+            failure_stages=(),
+            failure_code="INVALID_QUALITY_REPORT",
+        )
+    list_fields = {
+        name: quality.get(name)
+        for name in (
+            "reason_codes",
+            "warning_codes",
+            "blocking_codes",
+            "failure_stages",
+        )
+    }
+    if any(
+        not isinstance(values, list)
+        or not all(isinstance(item, str) and item for item in values)
+        for values in list_fields.values()
     ):
         return RouteAttempt(
             route=route,
             completed=True,
             contract_path=contract_path,
             quality_decision=None,
+            route_action=None,
             reason_codes=(),
+            warning_codes=(),
+            blocking_codes=(),
+            failure_stages=(),
+            failure_code="INVALID_QUALITY_REPORT",
+        )
+    reason_codes = set(list_fields["reason_codes"])
+    warning_codes = set(list_fields["warning_codes"])
+    blocking_codes = set(list_fields["blocking_codes"])
+    if (
+        reason_codes != warning_codes | blocking_codes
+        or warning_codes & blocking_codes
+        or (route_action == "publish" and blocking_codes)
+        or (route_action == "fallback" and not blocking_codes)
+    ):
+        return RouteAttempt(
+            route=route,
+            completed=True,
+            contract_path=contract_path,
+            quality_decision=None,
+            route_action=None,
+            reason_codes=(),
+            warning_codes=(),
+            blocking_codes=(),
+            failure_stages=(),
             failure_code="INVALID_QUALITY_REPORT",
         )
     return RouteAttempt(
@@ -145,5 +210,9 @@ def _run_and_assess(
         completed=True,
         contract_path=contract_path,
         quality_decision=decision,
-        reason_codes=tuple(sorted(set(reason_codes))),
+        route_action=route_action,
+        reason_codes=tuple(sorted(reason_codes)),
+        warning_codes=tuple(sorted(warning_codes)),
+        blocking_codes=tuple(sorted(blocking_codes)),
+        failure_stages=tuple(sorted(set(list_fields["failure_stages"]))),
     )

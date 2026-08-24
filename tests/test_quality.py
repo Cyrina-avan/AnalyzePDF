@@ -225,8 +225,11 @@ def test_quality_gate_accepts_complete_digital_text(
     report = assess_ingestion_quality(contract, source)
 
     assert report["decision"] == "accept"
-    assert report["quality_gate_version"] == 2
+    assert report["route_action"] == "publish"
+    assert report["quality_gate_version"] == 3
     assert report["reason_codes"] == []
+    assert report["warning_codes"] == []
+    assert report["blocking_codes"] == []
     assert report["metrics"]["cjk_internal_space_count"] == 0
 
 
@@ -249,7 +252,12 @@ def test_quality_gate_reviews_spurious_spaces_inside_chinese_text(
     report = assess_ingestion_quality(contract, source)
 
     assert report["decision"] == "review"
+    assert report["route_action"] == "publish"
     assert report["reason_codes"] == ["cjk_internal_space_ratio_above_policy"]
+    assert report["warning_codes"] == [
+        "cjk_internal_space_ratio_above_policy"
+    ]
+    assert report["blocking_codes"] == []
     assert report["metrics"]["cjk_internal_space_ratio"] > 0.01
 
 
@@ -305,8 +313,15 @@ def test_quality_gate_rejects_failed_encrypted_source(
     report = assess_ingestion_quality(contract, source)
 
     assert report["decision"] == "reject"
+    assert report["route_action"] == "fallback"
     assert report["metrics"]["text_characters"] == 0
     assert report["reason_codes"] == ["parse_failed", "source_pdf_encrypted"]
+    assert report["warning_codes"] == []
+    assert report["blocking_codes"] == [
+        "parse_failed",
+        "source_pdf_encrypted",
+    ]
+    assert report["failure_stages"] == ["parse"]
 
 
 def test_quality_gate_reviews_empty_table_artifact(
@@ -354,7 +369,11 @@ def test_quality_gate_rejects_source_contract_page_count_mismatch(
     report = assess_ingestion_quality(contract, source)
 
     assert report["decision"] == "reject"
+    assert report["route_action"] == "fallback"
     assert report["reason_codes"] == ["source_contract_page_count_mismatch"]
+    assert report["blocking_codes"] == [
+        "source_contract_page_count_mismatch"
+    ]
 
 
 def test_quality_gate_reviews_partial_page_count_mismatch(
@@ -376,8 +395,13 @@ def test_quality_gate_reviews_partial_page_count_mismatch(
 
     report = assess_ingestion_quality(contract, source)
 
-    assert report["decision"] == "review"
+    assert report["decision"] == "reject"
+    assert report["route_action"] == "fallback"
     assert report["reason_codes"] == [
+        "partial_parse",
+        "partial_source_contract_page_count_mismatch",
+    ]
+    assert report["blocking_codes"] == [
         "partial_parse",
         "partial_source_contract_page_count_mismatch",
     ]

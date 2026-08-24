@@ -16,8 +16,9 @@ from pypdf import PdfReader
 from analyzepdf.contracts.validation import load_contract
 
 
-QUALITY_GATE_VERSION = 2
+QUALITY_GATE_VERSION = 3
 Decision = Literal["accept", "review", "reject"]
+RouteAction = Literal["publish", "fallback"]
 _CJK_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _CJK_INTERNAL_HORIZONTAL_SPACE_RE = re.compile(
     r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])[ \t]+"
@@ -145,39 +146,39 @@ def assess_ingestion_quality(
         raise QualityGateError("Cannot read validated Contract payload") from exc
 
     source = inspect_pdf_source(source_pdf, policy=active_policy)
-    reject_reasons: set[str] = set()
-    review_reasons: set[str] = set()
+    blocking_reasons: set[str] = set()
+    warning_reasons: set[str] = set()
 
     if source["content_sha256"] != parsed.source_sha256:
-        reject_reasons.add("source_hash_mismatch")
+        blocking_reasons.add("source_hash_mismatch")
     if not source["readable"]:
-        reject_reasons.add(
+        blocking_reasons.add(
             "source_pdf_encrypted" if source["encrypted"] else "source_pdf_unreadable"
         )
     if parsed.status == "failed":
-        reject_reasons.add("parse_failed")
+        blocking_reasons.add("parse_failed")
     elif parsed.status == "partial":
-        review_reasons.add("partial_parse")
+        blocking_reasons.add("partial_parse")
 
     quality = contract["quality"]
     ocr = quality["ocr"]
     flags = set(quality["flags"])
     if "ocr_confidence_unavailable" in flags:
-        review_reasons.add("ocr_confidence_unavailable")
+        warning_reasons.add("ocr_confidence_unavailable")
     if ocr.get("low_confidence_pages"):
-        review_reasons.add("ocr_low_confidence_pages")
+        blocking_reasons.add("ocr_low_confidence_pages")
     mean_confidence = ocr.get("mean_confidence")
     if (
         isinstance(mean_confidence, (int, float))
         and mean_confidence < active_policy.minimum_ocr_mean_confidence
     ):
-        review_reasons.add("ocr_mean_confidence_below_policy")
+        blocking_reasons.add("ocr_mean_confidence_below_policy")
     if source["requires_ocr_pages"] and not ocr["used"] and parsed.status != "failed":
-        reject_reasons.add("ocr_required_but_disabled")
+        blocking_reasons.add("ocr_required_but_disabled")
     if source["low_resolution_scan_pages"]:
-        review_reasons.add("scan_resolution_below_policy")
+        warning_reasons.add("scan_resolution_below_policy")
     if source["unclassified_no_text_pages"]:
-        review_reasons.add("source_pages_without_classifiable_content")
+        warning_reasons.add("source_pages_without_classifiable_content")
 
     page_numbers = set(parsed.page_numbers)
     if (
@@ -186,9 +187,9 @@ def assess_ingestion_quality(
         and source["page_count"] != len(page_numbers)
     ):
         if parsed.status == "partial":
-            review_reasons.add("partial_source_contract_page_count_mismatch")
+            blocking_reasons.add("partial_source_contract_page_count_mismatch")
         else:
-            reject_reasons.add("source_contract_page_count_mismatch")
+            blocking_reasons.add("source_contract_page_count_mismatch")
     covered_pages: set[int] = set()
     text_covered_pages: set[int] = set()
     for element in contract["elements"]:
@@ -203,9 +204,9 @@ def assess_ingestion_quality(
 
     uncovered_pages = sorted(page_numbers - covered_pages)
     if page_numbers and len(uncovered_pages) == len(page_numbers):
-        reject_reasons.add("no_pages_with_parsed_content")
+        blocking_reasons.add("no_pages_with_parsed_content")
     elif uncovered_pages:
-        review_reasons.add("parsed_page_coverage_incomplete")
+        blocking_reasons.add("parsed_page_coverage_incomplete")
 
     text = parsed.text or ""
     page_count = len(page_numbers)
@@ -214,34 +215,52 @@ def assess_ingestion_quality(
         parsed.status != "failed"
         and text_characters_per_page < active_policy.minimum_text_characters_per_page
     ):
-        review_reasons.add("text_density_below_policy")
+        warning_reasons.add("text_density_below_policy")
     replacement_character_ratio = text.count("\ufffd") / max(len(text), 1)
     if replacement_character_ratio > active_policy.maximum_replacement_character_ratio:
-        review_reasons.add("replacement_character_ratio_above_policy")
+        blocking_reasons.add("replacement_character_ratio_above_policy")
     cjk_character_count = len(_CJK_CHARACTER_RE.findall(text))
     cjk_internal_space_count = len(_CJK_INTERNAL_HORIZONTAL_SPACE_RE.findall(text))
     cjk_internal_space_ratio = cjk_internal_space_count / max(cjk_character_count, 1)
     if cjk_internal_space_ratio > active_policy.maximum_cjk_internal_space_ratio:
-        review_reasons.add("cjk_internal_space_ratio_above_policy")
+        warning_reasons.add("cjk_internal_space_ratio_above_policy")
 
     table_metrics = _inspect_table_artifacts(contract_file.parent, contract)
     if table_metrics["empty_table_count"]:
-        review_reasons.add("empty_table_artifact")
+        warning_reasons.add("empty_table_artifact")
     if table_metrics["sparse_table_count"]:
-        review_reasons.add("sparse_table_artifact")
+        warning_reasons.add("sparse_table_artifact")
 
     decision: Decision
-    if reject_reasons:
+    route_action: RouteAction
+    if blocking_reasons:
         decision = "reject"
-    elif review_reasons:
+        route_action = "fallback"
+    elif warning_reasons:
         decision = "review"
+        route_action = "publish"
     else:
         decision = "accept"
+        route_action = "publish"
+
+    failure_stages = sorted(
+        {
+            stage
+            for error in contract["errors"]
+            if isinstance(error, dict)
+            and isinstance((stage := error.get("stage")), str)
+            and stage
+        }
+    )
 
     return {
         "quality_gate_version": QUALITY_GATE_VERSION,
         "decision": decision,
-        "reason_codes": sorted(reject_reasons | review_reasons),
+        "route_action": route_action,
+        "reason_codes": sorted(blocking_reasons | warning_reasons),
+        "warning_codes": sorted(warning_reasons),
+        "blocking_codes": sorted(blocking_reasons),
+        "failure_stages": failure_stages,
         "source": {key: value for key, value in source.items() if key != "pages"},
         "metrics": {
             "contract_status": parsed.status,
