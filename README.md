@@ -22,6 +22,11 @@ AnalyzePDF 不负责：
 
 正文清洗和文档结构修复属于 DocumentNormalization；知识抽取、检索和问答属于 EmergentKB。三个项目不共享 Python 环境，只通过有版本的机器可读结果连接。
 
+## 项目记录
+
+- [当前交接](docs/HANDOFF.md)：当前状态、真实运行证据和停止线；
+- [问题日志](docs/PROBLEM_LOG.md)：本仓库长期问题、失败方案、证据、决定和未解决项。
+
 ## 当前路线
 
 ```text
